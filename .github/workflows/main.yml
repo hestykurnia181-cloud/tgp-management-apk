@@ -1,4 +1,4 @@
-name: Auto Extract ZIP & Build
+name: Build Android APK
 
 on:
   push:
@@ -11,84 +11,105 @@ permissions:
   contents: write
 
 jobs:
-  extract-and-commit:
+  build-android-apk:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        id: setup-java
         with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract ZIP if exists
-        run: |
-          ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
-          if [ -n "$ZIP_FILE" ]; then
-            echo "Menemukan file zip: $ZIP_FILE"
-            mkdir -p temp_unzip
-            unzip -q -o "$ZIP_FILE" -d temp_unzip
-            
-            # Cek jika isi zip terbungkus dalam satu subfolder
-            NUM_ITEMS=$(ls -1 temp_unzip | wc -l)
-            FIRST_ITEM=$(ls -1 temp_unzip | head -n 1)
-            if [ "$NUM_ITEMS" -eq 1 ] && [ -d "temp_unzip/$FIRST_ITEM" ]; then
-              echo "Memindahkan isi dari subfolder $FIRST_ITEM..."
-              rm -rf "temp_unzip/$FIRST_ITEM/.github"
-              cp -r temp_unzip/$FIRST_ITEM/. .
-            else
-              echo "Memindahkan isi zip ke root..."
-              rm -rf temp_unzip/.github
-              cp -r temp_unzip/. .
-            fi
-            
-            # Hapus folder sementara dan file zip
-            rm -rf temp_unzip
-            rm -f "$ZIP_FILE"
-            
-            # Konfigurasi Git untuk commit otomatis
-            git config --global user.name "github-actions[bot]"
-            git config --global user.email "github-actions[bot]@users.noreply.github.com"
-            
-            # Tambahkan semua file baru hasil ekstrak
-            git add -A
-            
-            # Jangan sentuh folder .github
-            git reset HEAD .github/ 2>/dev/null || true
-            git checkout HEAD -- .github/ 2>/dev/null || true
-            
-            if git diff --staged --quiet; then
-              echo "Tidak ada perubahan file baru."
-            else
-              git commit -m "ci: otomatis ekstrak file proyek dari ZIP"
-              git push origin HEAD:${{ github.ref_name }}
-              echo "Berhasil mengekstrak semua file ke repository!"
-            fi
-          else
-            echo "Belum ada file .zip yang di-upload. Siap menerima file ZIP."
-          fi
-
-      - name: Check if package.json exists
-        id: check_pkg
-        run: |
-          if [ -f "package.json" ]; then
-            echo "pkg_exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "pkg_exists=false" >> $GITHUB_OUTPUT
-            echo "package.json belum ada. Melewati build."
-          fi
+          distribution: 'temurin'
+          java-version: '21'
 
       - name: Setup Node.js
-        if: steps.check_pkg.outputs.pkg_exists == 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 20
 
-      - name: Install Dependencies
-        if: steps.check_pkg.outputs.pkg_exists == 'true'
+      - name: Install Project Dependencies
         run: |
           npm install --include=optional
           npm install --no-save @tailwindcss/oxide-linux-x64-gnu 2>/dev/null || true
 
+      - name: Build Web Dist
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || 'https://shcvlcrdjcaslqrapudx.supabase.co' }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNoY3ZsY3JkamNhc2xxcmFwdWR4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg1MDk1NDUsImV4cCI6MjEwNDA4NTU0NX0.YILx2dwA9GtGl2oNsCXHbfgNxid7397fPVjaXFHt_JM' }}
+        run: npm run build
+
+      - name: Setup Capacitor Config & Android
+        run: |
+          npm install --save @capacitor/core @capacitor/cli @capacitor/android
+          cat << 'EOF' > capacitor.config.json
+          {
+            "appId": "com.tgp.management",
+            "appName": "TGP Management",
+            "webDir": "dist"
+          }
+          EOF
+          cat << 'EOF' > capacitor.config.ts
+          import type { CapacitorConfig } from '@capacitor/cli';
+          const config: CapacitorConfig = {
+            appId: 'com.tgp.management',
+            appName: 'TGP Management',
+            webDir: 'dist'
+          };
+          export default config;
+          EOF
+          npx cap add android
+          npx cap sync android
+
+      - name: Accept Android Licenses & Build APK with Java 21
+        env:
+          JAVA_HOME: ${{ steps.setup-java.outputs.path }}
+        run: |
+          export JAVA_HOME="${{ steps.setup-java.outputs.path }}"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          
+          echo "Verified Java Runtime:"
+          "$JAVA_HOME/bin/java" -version
+          "$JAVA_HOME/bin/javac" -version
+          
+          # Force Gradle daemon to use Java 21
+          echo "org.gradle.java.home=$JAVA_HOME" >> android/gradle.properties
+          
+          # Ensure all subprojects (including :capacitor-android) compile using Java 21
+          cat << 'EOF' >> android/build.gradle
+
+          allprojects {
+              tasks.withType(JavaCompile).configureEach {
+                  sourceCompatibility = JavaVersion.VERSION_21
+                  targetCompatibility = JavaVersion.VERSION_21
+              }
+          }
+          subprojects {
+              afterEvaluate { project ->
+                  if (project.hasProperty('android')) {
+                      project.android {
+                          compileOptions {
+                              sourceCompatibility JavaVersion.VERSION_21
+                              targetCompatibility JavaVersion.VERSION_21
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses 2>/dev/null || true
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon -Dorg.gradle.java.home="$JAVA_HOME"
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TGP-Management-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
       - name: Build Check
         if: steps.check_pkg.outputs.pkg_exists == 'true'
         continue-on-error: true
