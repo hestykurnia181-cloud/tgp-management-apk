@@ -1,0 +1,98 @@
+name: Auto Extract ZIP & Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extract-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract ZIP if exists
+        run: |
+          ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Menemukan file zip: $ZIP_FILE"
+            mkdir -p temp_unzip
+            unzip -q -o "$ZIP_FILE" -d temp_unzip
+            
+            # Cek jika isi zip terbungkus dalam satu subfolder
+            NUM_ITEMS=$(ls -1 temp_unzip | wc -l)
+            FIRST_ITEM=$(ls -1 temp_unzip | head -n 1)
+            if [ "$NUM_ITEMS" -eq 1 ] && [ -d "temp_unzip/$FIRST_ITEM" ]; then
+              echo "Memindahkan isi dari subfolder $FIRST_ITEM..."
+              rm -rf "temp_unzip/$FIRST_ITEM/.github"
+              cp -r temp_unzip/$FIRST_ITEM/. .
+            else
+              echo "Memindahkan isi zip ke root..."
+              rm -rf temp_unzip/.github
+              cp -r temp_unzip/. .
+            fi
+            
+            # Hapus folder sementara dan file zip
+            rm -rf temp_unzip
+            rm -f "$ZIP_FILE"
+            
+            # Konfigurasi Git untuk commit otomatis
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            
+            # Tambahkan semua file baru hasil ekstrak
+            git add -A
+            
+            # Jangan sentuh folder .github
+            git reset HEAD .github/ 2>/dev/null || true
+            git checkout HEAD -- .github/ 2>/dev/null || true
+            
+            if git diff --staged --quiet; then
+              echo "Tidak ada perubahan file baru."
+            else
+              git commit -m "ci: otomatis ekstrak file proyek dari ZIP"
+              git push origin HEAD:${{ github.ref_name }}
+              echo "Berhasil mengekstrak semua file ke repository!"
+            fi
+          else
+            echo "Belum ada file .zip yang di-upload. Siap menerima file ZIP."
+          fi
+
+      - name: Check if package.json exists
+        id: check_pkg
+        run: |
+          if [ -f "package.json" ]; then
+            echo "pkg_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "pkg_exists=false" >> $GITHUB_OUTPUT
+            echo "package.json belum ada. Melewati build."
+          fi
+
+      - name: Setup Node.js
+        if: steps.check_pkg.outputs.pkg_exists == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install Dependencies
+        if: steps.check_pkg.outputs.pkg_exists == 'true'
+        run: |
+          npm install --include=optional
+          npm install --no-save @tailwindcss/oxide-linux-x64-gnu 2>/dev/null || true
+
+      - name: Build Check
+        if: steps.check_pkg.outputs.pkg_exists == 'true'
+        continue-on-error: true
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || 'https://shcvlcrdjcaslqrapudx.supabase.co' }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNoY3ZsY3JkamNhc2xxcmFwdWR4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg1MDk1NDUsImV4cCI6MjEwNDA4NTU0NX0.YILx2dwA9GtGl2oNsCXHbfgNxid7397fPVjaXFHt_JM' }}
+        run: npm run build
