@@ -1,0 +1,8 @@
+{
+  "appId": "com.tgp.management",
+  "appName": "TGP Management",
+  "webDir": "dist",
+  "server": {
+    "cleartext": true
+  }
+}
